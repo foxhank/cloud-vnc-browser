@@ -7,6 +7,10 @@ on:
         description: '会话时长（分钟，1-35，默认 30）'
         required: false
         default: '30'
+      vnc_password:
+        description: 'VNC 密码（留空则随机生成，仅限字母数字，最长 8 位）'
+        required: false
+        default: ''
 
 # 同一时间只保留一个云端会话；重新触发会自动取消旧的
 concurrency:
@@ -39,8 +43,13 @@ jobs:
           echo "minutes=$MIN" >> "$GITHUB_OUTPUT"
 
       - name: 启动浏览器容器（Chrome + Xvfb + VNC + noVNC）
+        env:
+          RAW_PASS: ${{ github.event.inputs.vnc_password }}
         run: |
-          VNC_PASS="$(head -c 64 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 8)"
+          VNC_PASS=$(echo "$RAW_PASS" | tr -cd 'a-zA-Z0-9' | head -c 8)
+          if [ -z "$VNC_PASS" ]; then
+            VNC_PASS="$(head -c 64 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 8)"
+          fi
           printf '%s' "$VNC_PASS" > /tmp/vnc_pass
           docker run -d --name cloud-browser \
             -p 127.0.0.1:7900:7900 \
