@@ -122,13 +122,17 @@ jobs:
           PASS=$(cat /tmp/vnc_pass)
           MIN=${{ steps.dur.outputs.minutes }}
           LINK="http://${FRP_SERVER}:${PORT}/?autoconnect=1&password=$PASS"
+          # 自检：从 runner 走公网完整链路验证映射可用
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 15 "http://${FRP_SERVER}:${PORT}/" || true)
           echo "✅ 云端浏览器已就绪，把下面链接复制到本地浏览器打开："
           echo "   $LINK"
+          echo "   （服务端自检：HTTP ${CODE:-无响应}）"
           {
             echo "## ☁️ 云端浏览器已就绪"
             echo ""
             echo "**👉 [点击打开云端浏览器]($LINK)**"
             echo ""
+            echo "- 服务端自检：HTTP ${CODE:-无响应}（200 即链路正常）"
             echo "- 密码已内置在链接里，不要把链接发给别人"
             echo "- 本次会话时长：**${MIN} 分钟**，到期自动销毁"
             echo "- 想提前结束：回到本页右上角 **Cancel workflow**"
