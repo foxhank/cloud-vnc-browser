@@ -1,0 +1,154 @@
+name: Cloud VNC Browser
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: '会话时长（分钟，1-35，默认 30）'
+        required: false
+        default: '30'
+
+# 同一时间只保留一个云端会话；重新触发会自动取消旧的
+concurrency:
+  group: cloud-browser
+  cancel-in-progress: true
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    # 硬性兜底：无论输入多大，这个 job 最多 40 分钟就会被强杀销毁
+    timeout-minutes: 40
+
+    env:
+      FRP_SERVER: frp.foxhank.top
+      FRP_SERVER_PORT: "7000"
+      FRP_USER: user67
+      FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
+
+    steps:
+      - name: 计算会话时长
+        id: dur
+        env:
+          RAW: ${{ github.event.inputs.duration_minutes }}
+        run: |
+          MIN=$(echo "$RAW" | tr -cd '0-9')
+          [ -z "$MIN" ] && MIN=30
+          [ "$MIN" -lt 1 ] && MIN=1
+          [ "$MIN" -gt 35 ] && MIN=35
+          echo "本次会话时长：${MIN} 分钟"
+          echo "minutes=$MIN" >> "$GITHUB_OUTPUT"
+
+      - name: 启动浏览器容器（Chrome + Xvfb + VNC + noVNC）
+        run: |
+          VNC_PASS="$(head -c 64 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 8)"
+          printf '%s' "$VNC_PASS" > /tmp/vnc_pass
+          docker run -d --name cloud-browser \
+            -p 127.0.0.1:7900:7900 \
+            -e SE_VNC_PASSWORD="$VNC_PASS" \
+            -e VNC_PASSWORD="$VNC_PASS" \
+            -e SE_SCREEN_WIDTH=1600 -e SE_SCREEN_HEIGHT=900 \
+            -e SCREEN_WIDTH=1600 -e SCREEN_HEIGHT=900 \
+            --shm-size=2g \
+            selenium/standalone-chrome:latest
+          # 兜底：如果镜像不支持自定义密码变量，启动日志里会打印实际密码
+          sleep 5
+          docker logs cloud-browser 2>&1 | grep -i 'password' || true
+
+      - name: 安装 frpc（与你本地同版本 0.65.0）
+        run: |
+          mkdir -p /tmp/frp
+          curl -sSL -o /tmp/frp.tar.gz \
+            https://github.com/fatedier/frp/releases/download/v0.65.0/frp_0.65.0_linux_amd64.tar.gz
+          tar -xzf /tmp/frp.tar.gz -C /tmp
+          mv /tmp/frp_0.65.0_linux_amd64/frpc /tmp/frp/frpc
+          chmod +x /tmp/frp/frpc
+          /tmp/frp/frpc -v
+
+      - name: 随机端口建立 frp 映射
+        run: |
+          if [ -z "$FRP_TOKEN" ]; then
+            echo "::error::缺少 Secret：FRP_TOKEN。到仓库 Settings → Secrets and variables → Actions 添加"
+            exit 1
+          fi
+          REMOTE=""
+          for attempt in 1 2 3 4 5 6 7 8; do
+            PORT=$(shuf -i 20000-60000 -n 1)
+            rm -f /tmp/frp/frpc.log
+            cat > /tmp/frp/frpc.toml <<EOF
+          serverAddr = "${FRP_SERVER}"
+          serverPort = ${FRP_SERVER_PORT}
+          user = "${FRP_USER}"
+          metadatas.token = "${FRP_TOKEN}"
+
+          log.to = "/tmp/frp/frpc.log"
+          log.level = "info"
+          log.maxDays = 1
+
+          [[proxies]]
+          name = "vnc_tcp"
+          type = "tcp"
+          localIP = "127.0.0.1"
+          localPort = 7900
+          remotePort = ${PORT}
+          EOF
+            pkill -x frpc 2>/dev/null || true
+            /tmp/frp/frpc -c /tmp/frp/frpc.toml > /tmp/frp/frpc_stdout.log 2>&1 &
+            OK=""
+            for i in $(seq 1 15); do
+              if grep -q 'start proxy success' /tmp/frp/frpc.log 2>/dev/null; then OK=1; break; fi
+              grep -q 'login to server failed' /tmp/frp/frpc.log 2>/dev/null && break
+              grep -qE 'port not allowed|port already used' /tmp/frp/frpc.log 2>/dev/null && break
+              sleep 1
+            done
+            if [ -n "$OK" ]; then REMOTE=$PORT; break; fi
+            if grep -q 'login to server failed' /tmp/frp/frpc.log 2>/dev/null; then
+              echo "::error::frp 登录失败，检查 Secret FRP_TOKEN 和 user 是否正确"
+              tail -n 30 /tmp/frp/frpc.log
+              exit 1
+            fi
+            echo "端口 ${PORT} 不可用（被占用或不允许），换一个重试（第 ${attempt} 次）..."
+          done
+          if [ -z "$REMOTE" ]; then
+            echo "::error::8 个随机端口都失败了。如果你的 frp 服务端限制了可用端口范围，改工作流 env 附近 shuf 的端口区间"
+            tail -n 50 /tmp/frp/frpc.log
+            exit 1
+          fi
+          echo "$REMOTE" > /tmp/frp/remote_port
+          echo "✅ frp 映射成功：${FRP_SERVER}:${REMOTE} → 本机 7900（noVNC）"
+
+      - name: 输出访问地址
+        run: |
+          PORT=$(cat /tmp/frp/remote_port)
+          PASS=$(cat /tmp/vnc_pass)
+          MIN=${{ steps.dur.outputs.minutes }}
+          LINK="http://${FRP_SERVER}:${PORT}/?autoconnect=1&password=$PASS"
+          echo "✅ 云端浏览器已就绪，把下面链接复制到本地浏览器打开："
+          echo "   $LINK"
+          {
+            echo "## ☁️ 云端浏览器已就绪"
+            echo ""
+            echo "**👉 [点击打开云端浏览器]($LINK)**"
+            echo ""
+            echo "- 密码已内置在链接里，不要把链接发给别人"
+            echo "- 本次会话时长：**${MIN} 分钟**，到期自动销毁"
+            echo "- 想提前结束：回到本页右上角 **Cancel workflow**"
+            echo "- 备用 VNC 密码：\`$PASS\`（在 noVNC 页面手动连接时用）"
+            echo "- 注意：走的是 http 明文 + 随机端口，内容不加密，别在这个浏览器里登录重要账号"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 保持会话，到期自动销毁
+        run: |
+          MIN=${{ steps.dur.outputs.minutes }}
+          END=$((SECONDS + MIN * 60))
+          i=0
+          while [ $SECONDS -lt $END ]; do
+            sleep 60
+            i=$((i+1))
+            if [ $((i % 5)) -eq 0 ]; then
+              LEFT=$(( (END - SECONDS + 59) / 60 ))
+              echo "⏳ 云端浏览器剩余约 ${LEFT} 分钟..."
+            fi
+          done
+          echo "⏰ 时间到，销毁会话。"
+          pkill -x frpc 2>/dev/null || true
+          docker rm -f cloud-browser || true
